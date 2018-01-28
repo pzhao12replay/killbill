@@ -33,15 +33,11 @@ import org.killbill.notificationq.api.NotificationQueueService.NoSuchNotificatio
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 
 public class DefaultNextBillingDatePoster implements NextBillingDatePoster {
 
     private static final Logger log = LoggerFactory.getLogger(DefaultNextBillingDatePoster.class);
-
-    private static Joiner JOINER = Joiner.on(",");
 
     private final NotificationQueueService notificationQueueService;
 
@@ -51,29 +47,20 @@ public class DefaultNextBillingDatePoster implements NextBillingDatePoster {
     }
 
     @Override
-    public void insertNextBillingNotificationFromTransaction(final EntitySqlDaoWrapperFactory entitySqlDaoWrapperFactory,
-                                                             final UUID accountId,
-                                                             final Iterable<UUID> subscriptionIds,
-                                                             final DateTime futureNotificationTime,
-                                                             final InternalCallContext internalCallContext) {
-        insertNextBillingFromTransactionInternal(entitySqlDaoWrapperFactory, subscriptionIds, Boolean.FALSE, futureNotificationTime, futureNotificationTime, internalCallContext);
+    public void insertNextBillingNotificationFromTransaction(final EntitySqlDaoWrapperFactory entitySqlDaoWrapperFactory, final UUID accountId,
+                                                             final UUID subscriptionId, final DateTime futureNotificationTime, final InternalCallContext internalCallContext) {
+        insertNextBillingFromTransactionInternal(entitySqlDaoWrapperFactory, subscriptionId, Boolean.FALSE, futureNotificationTime, futureNotificationTime, internalCallContext);
     }
 
     @Override
-    public void insertNextBillingDryRunNotificationFromTransaction(final EntitySqlDaoWrapperFactory entitySqlDaoWrapperFactory,
-                                                                   final UUID accountId,
-                                                                   final Iterable<UUID> subscriptionIds,
-                                                                   final DateTime futureNotificationTime,
-                                                                   final DateTime targetDate,
-                                                                   final InternalCallContext internalCallContext) {
-        insertNextBillingFromTransactionInternal(entitySqlDaoWrapperFactory, subscriptionIds, Boolean.TRUE, futureNotificationTime, targetDate, internalCallContext);
+    public void insertNextBillingDryRunNotificationFromTransaction(final EntitySqlDaoWrapperFactory entitySqlDaoWrapperFactory, final UUID accountId,
+                                                                   final UUID subscriptionId, final DateTime futureNotificationTime, final DateTime targetDate, final InternalCallContext internalCallContext) {
+        insertNextBillingFromTransactionInternal(entitySqlDaoWrapperFactory, subscriptionId, Boolean.TRUE, futureNotificationTime, targetDate, internalCallContext);
     }
 
     private void insertNextBillingFromTransactionInternal(final EntitySqlDaoWrapperFactory entitySqlDaoWrapperFactory,
-                                                          final Iterable<UUID> subscriptionIds,
-                                                          final Boolean isDryRunForInvoiceNotification,
-                                                          final DateTime futureNotificationTime,
-                                                          final DateTime targetDate,
+                                                          final UUID subscriptionId, final Boolean isDryRunForInvoiceNotification,
+                                                          final DateTime futureNotificationTime, final DateTime targetDate,
                                                           final InternalCallContext internalCallContext) {
         final NotificationQueue nextBillingQueue;
         try {
@@ -83,7 +70,7 @@ public class DefaultNextBillingDatePoster implements NextBillingDatePoster {
             // If we see existing notification for the same date (and isDryRunForInvoiceNotification mode), we don't insert a new notification
             final Iterable<NotificationEventWithMetadata<NextBillingDateNotificationKey>> futureNotifications = nextBillingQueue.getFutureNotificationFromTransactionForSearchKeys(internalCallContext.getAccountRecordId(), internalCallContext.getTenantRecordId(), entitySqlDaoWrapperFactory.getHandle().getConnection());
 
-            NotificationEventWithMetadata<NextBillingDateNotificationKey> existingNotificationForEffectiveDate = null;
+            boolean existingFutureNotificationWithSameDate = false;
             for (final NotificationEventWithMetadata<NextBillingDateNotificationKey> input : futureNotifications) {
                 final boolean isEventDryRunForNotifications = input.getEvent().isDryRunForInvoiceNotification() != null ?
                                                               input.getEvent().isDryRunForInvoiceNotification() : false;
@@ -94,28 +81,25 @@ public class DefaultNextBillingDatePoster implements NextBillingDatePoster {
                 if (notificationEffectiveLocaleDate.compareTo(eventEffectiveLocaleDate) == 0 &&
                     ((isDryRunForInvoiceNotification && isEventDryRunForNotifications) ||
                      (!isDryRunForInvoiceNotification && !isEventDryRunForNotifications))) {
-                    existingNotificationForEffectiveDate = input;
+                    existingFutureNotificationWithSameDate = true;
                 }
                 // Go through all results to close the connection
             }
 
-            if (existingNotificationForEffectiveDate == null) {
-                log.info("Queuing next billing date notification at {} for subscriptionId {}", futureNotificationTime.toString(), JOINER.join(subscriptionIds));
+            if (!existingFutureNotificationWithSameDate) {
+                log.info("Queuing next billing date notification at {} for subscriptionId {}", futureNotificationTime.toString(), subscriptionId.toString());
 
-                final NextBillingDateNotificationKey newNotificationEvent = new NextBillingDateNotificationKey(null, subscriptionIds, targetDate, isDryRunForInvoiceNotification);
                 nextBillingQueue.recordFutureNotificationFromTransaction(entitySqlDaoWrapperFactory.getHandle().getConnection(), futureNotificationTime,
-                                                                         newNotificationEvent, internalCallContext.getUserToken(),
+                                                                         new NextBillingDateNotificationKey(subscriptionId, targetDate, isDryRunForInvoiceNotification), internalCallContext.getUserToken(),
                                                                          internalCallContext.getAccountRecordId(), internalCallContext.getTenantRecordId());
-            } else {
-                log.info("Updating next billing date notification event at {} for subscriptionId {}", futureNotificationTime.toString(), JOINER.join(subscriptionIds));
-                final NextBillingDateNotificationKey updateNotificationEvent = new NextBillingDateNotificationKey(existingNotificationForEffectiveDate.getEvent(), subscriptionIds);
-                nextBillingQueue.updateFutureNotificationFromTransaction(entitySqlDaoWrapperFactory.getHandle().getConnection(), existingNotificationForEffectiveDate.getRecordId(), updateNotificationEvent, internalCallContext.getAccountRecordId(), internalCallContext.getTenantRecordId());
+            } else if (log.isDebugEnabled()) {
+                log.debug("*********************   SKIPPING Queuing next billing date notification at {} for subscriptionId {} *******************", futureNotificationTime.toString(), subscriptionId.toString());
             }
 
         } catch (final NoSuchNotificationQueue e) {
             log.error("Attempting to put items on a non-existent queue (NextBillingDateNotifier).", e);
         } catch (final IOException e) {
-            log.error("Failed to serialize notificationKey for subscriptionId {}", subscriptionIds);
+            log.error("Failed to serialize notificationKey for subscriptionId {}", subscriptionId);
         }
     }
 
